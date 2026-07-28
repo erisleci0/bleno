@@ -10,6 +10,7 @@ const smpPath = require.resolve('../lib/hci-socket/smp');
 const mgmtPath = require.resolve('../lib/hci-socket/mgmt');
 const cachedSmp = require.cache[smpPath];
 const cachedMgmt = require.cache[mgmtPath];
+const mgmtCalls = [];
 
 delete require.cache[smpPath];
 require.cache[mgmtPath] = {
@@ -17,7 +18,9 @@ require.cache[mgmtPath] = {
   filename: mgmtPath,
   loaded: true,
   exports: {
-    addLongTermKey: function() {}
+    addLongTermKey: function() {
+      mgmtCalls.push(Array.prototype.slice.call(arguments));
+    }
   }
 };
 
@@ -45,7 +48,13 @@ function createSmp(options) {
   const aclStream = new EventEmitter();
 
   aclStream.writes = [];
+  aclStream.writeFailureIndex = null;
+  aclStream.pendingSetCount = 0;
   aclStream.write = function(cid, data) {
+    if (this.writeFailureIndex === this.writes.length) {
+      throw new Error('ACL write failed');
+    }
+
     this.writes.push({
       cid,
       data: Buffer.from(data)
@@ -57,6 +66,7 @@ function createSmp(options) {
       throw new Error('SC encryption material is already pending');
     }
 
+    this.pendingSetCount++;
     this.pendingScEncryptionMaterial = {
       ltk: Buffer.from(material.ltk),
       secureConnections: material.secureConnections,
@@ -1650,6 +1660,836 @@ describe('HCI socket SMP ephemeral key exchange', function() {
         endedConnection.aclStream.pendingScEncryptionMaterial,
         null
       );
+    });
+  });
+
+  describe('live SC Just Works responder', function() {
+    const livePairingRequest = Buffer.from([
+      0x01,
+      0x02, // IO capability: KeyboardOnly
+      0x00, // OOB data not present
+      0x09, // Bonding requested and SC supported, no MITM
+      0x10,
+      0x00,
+      0x00
+    ]);
+    const livePairingResponse = Buffer.from([
+      0x02,
+      0x03, // IO capability: NoInputNoOutput
+      0x00, // OOB data not present
+      0x08, // SC, no MITM, no bonding
+      0x10,
+      0x00,
+      0x00
+    ]);
+    const liveExpectedEa = bluetoothCrypto.f6(
+      expectedMacKey,
+      peerNonceA,
+      localNonceB,
+      Buffer.alloc(16),
+      hex('090002'),
+      initiatorAddress,
+      responderAddress
+    );
+    const liveExpectedEb = bluetoothCrypto.f6(
+      expectedMacKey,
+      localNonceB,
+      peerNonceA,
+      Buffer.alloc(16),
+      hex('080003'),
+      responderAddress,
+      initiatorAddress
+    );
+
+    function emitSmp(connection, pdu) {
+      connection.aclStream.emit(
+        'data',
+        0x0006,
+        Buffer.from(pdu)
+      );
+    }
+
+    function withDeterministicRuntime(action) {
+      const originalGenerateP256KeyPair =
+        bluetoothCrypto.generateP256KeyPair;
+      const originalR = bluetoothCrypto.r;
+
+      bluetoothCrypto.generateP256KeyPair = function() {
+        return originalGenerateP256KeyPair(privateB);
+      };
+      bluetoothCrypto.r = function() {
+        return Buffer.from(localNonceB);
+      };
+
+      try {
+        action();
+      } finally {
+        bluetoothCrypto.generateP256KeyPair =
+          originalGenerateP256KeyPair;
+        bluetoothCrypto.r = originalR;
+      }
+    }
+
+    function startLiveSc(connection, request) {
+      withDeterministicRuntime(function() {
+        emitSmp(
+          connection,
+          request || livePairingRequest
+        );
+      });
+    }
+
+    function completeLivePublicKey(connection) {
+      withDeterministicRuntime(function() {
+        if (connection.smp._pairingMode === 'none') {
+          emitSmp(connection, livePairingRequest);
+        }
+
+        emitSmp(
+          connection,
+          Smp.buildPairingPublicKeyPdu(publicA)
+        );
+      });
+    }
+
+    function completeLiveRandom(connection) {
+      completeLivePublicKey(connection);
+      emitSmp(
+        connection,
+        Smp.buildPairingRandomPdu(peerNonceA)
+      );
+    }
+
+    function completeLiveDhKeyCheck(connection) {
+      completeLiveRandom(connection);
+      emitSmp(
+        connection,
+        Smp.buildPairingDhKeyCheckPdu(liveExpectedEa)
+      );
+    }
+
+    function lastWrite(connection) {
+      const writes = connection.aclStream.writes;
+      return writes[writes.length - 1].data;
+    }
+
+    it('should negotiate SC and send the non-bonding response', function() {
+      const connection = newConnection(officialAddressOptions);
+      const request = Buffer.from(livePairingRequest);
+      const originalRequest = Buffer.from(request);
+
+      startLiveSc(connection, request);
+
+      assert.deepStrictEqual(request, originalRequest);
+      assert.deepStrictEqual(
+        connection.aclStream.writes,
+        [{
+          cid: 0x0006,
+          data: livePairingResponse
+        }]
+      );
+      assert.strictEqual(
+        connection.smp._pairingMode,
+        'secureConnections'
+      );
+      assert.strictEqual(
+        connection.smp._pairingStage,
+        'pairingFeaturesExchanged'
+      );
+      assert.notStrictEqual(connection.smp._scKeyExchange, null);
+      assert.notStrictEqual(connection.smp._pairingTimer, null);
+    });
+
+    it('should preserve the Legacy feature response', function() {
+      const connection = newConnection();
+      const legacyRequest = Buffer.from([
+        0x01,
+        0x03,
+        0x00,
+        0x01,
+        0x10,
+        0x00,
+        0x01
+      ]);
+
+      emitSmp(connection, legacyRequest);
+
+      assert.deepStrictEqual(
+        connection.aclStream.writes[0].data,
+        Buffer.from([
+          0x02,
+          0x03,
+          0x00,
+          0x01,
+          0x10,
+          0x00,
+          0x01
+        ])
+      );
+      assert.strictEqual(connection.smp._pairingMode, 'legacy');
+      assert.strictEqual(connection.smp._scKeyExchange, null);
+      assert.strictEqual(connection.smp._pairingTimer, null);
+    });
+
+    it('should strictly validate Pairing Request features', function() {
+      const cases = [
+        {
+          update: function(request) {
+            return request.slice(0, 6);
+          },
+          reason: 0x0a
+        },
+        {
+          update: function(request) {
+            request[4] = 6;
+            return request;
+          },
+          reason: 0x06
+        },
+        {
+          update: function(request) {
+            request[4] = 17;
+            return request;
+          },
+          reason: 0x0a
+        },
+        {
+          update: function(request) {
+            request[2] = 1;
+            return request;
+          },
+          reason: 0x02
+        },
+        {
+          update: function(request) {
+            request[3] |= 0x04;
+            return request;
+          },
+          reason: 0x03
+        }
+      ];
+
+      cases.forEach(function(testCase) {
+        const connection = newConnection();
+        const request = testCase.update(
+          Buffer.from(livePairingRequest)
+        );
+        let failureCount = 0;
+
+        connection.smp.on('fail', function() {
+          failureCount++;
+        });
+        emitSmp(connection, request);
+
+        assert.deepStrictEqual(
+          lastWrite(connection),
+          Buffer.from([0x05, testCase.reason])
+        );
+        assert.strictEqual(failureCount, 1);
+        assert.strictEqual(connection.smp._scKeyExchange, null);
+      });
+    });
+
+    it('should lock the selected pairing mode', function() {
+      const scConnection = newConnection();
+      const legacyRequest = Buffer.from([
+        0x01, 0x03, 0x00, 0x01, 0x10, 0x00, 0x01
+      ]);
+
+      startLiveSc(scConnection);
+      emitSmp(scConnection, legacyRequest);
+
+      assert.deepStrictEqual(
+        lastWrite(scConnection),
+        Buffer.from([0x05, 0x0a])
+      );
+      assert.strictEqual(scConnection.aclStream.writes.length, 2);
+
+      emitSmp(scConnection, Buffer.alloc(17, 0x03));
+
+      assert.strictEqual(scConnection.aclStream.writes.length, 2);
+
+      const legacyConnection = newConnection();
+
+      emitSmp(legacyConnection, legacyRequest);
+      emitSmp(
+        legacyConnection,
+        Smp.buildPairingPublicKeyPdu(publicA)
+      );
+
+      assert.deepStrictEqual(
+        lastWrite(legacyConnection),
+        Buffer.from([0x05, 0x07])
+      );
+      assert.strictEqual(
+        legacyConnection.smp._scKeyExchange,
+        null
+      );
+    });
+
+    it('should complete the live responder sequence in exact order', function() {
+      const connection = newConnection(officialAddressOptions);
+      const mgmtCallCount = mgmtCalls.length;
+      let pendingAtEbWrite;
+      const originalWrite = connection.aclStream.write;
+
+      connection.aclStream.write = function(cid, data) {
+        if (data[0] === 0x0d) {
+          pendingAtEbWrite = this.pendingScEncryptionMaterial;
+        }
+
+        originalWrite.call(this, cid, data);
+      };
+
+      completeLiveDhKeyCheck(connection);
+
+      const expectedConfirm = bluetoothCrypto.f4(
+        publicB.slice(0, 32),
+        publicA.slice(0, 32),
+        localNonceB,
+        Buffer.from([0x00])
+      );
+      const writes = connection.aclStream.writes.map(function(write) {
+        return write.data;
+      });
+
+      assert.deepStrictEqual(writes, [
+        livePairingResponse,
+        Smp.buildPairingPublicKeyPdu(publicB),
+        Smp.buildPairingConfirmPdu(expectedConfirm),
+        Smp.buildPairingRandomPdu(localNonceB),
+        Smp.buildPairingDhKeyCheckPdu(liveExpectedEb)
+      ]);
+      assert.strictEqual(pendingAtEbWrite, null);
+      assert.strictEqual(connection.aclStream.pendingSetCount, 1);
+      assert.deepStrictEqual(
+        connection.aclStream.pendingScEncryptionMaterial,
+        {
+          ltk: expectedLtk,
+          secureConnections: true,
+          authenticated: false,
+          bonded: false,
+          keySize: 16
+        }
+      );
+      assert.strictEqual(
+        connection.smp._pairingStage,
+        'waitingForEncryption'
+      );
+      assert.strictEqual(mgmtCalls.length, mgmtCallCount);
+
+      const pendingLtk =
+        connection.aclStream.pendingScEncryptionMaterial.ltk;
+
+      connection.aclStream.emit('encryptChange', true);
+
+      assertZeroed(pendingLtk);
+      assert.strictEqual(
+        connection.aclStream.pendingScEncryptionMaterial,
+        null
+      );
+      assert.strictEqual(connection.smp._scKeyExchange, null);
+      assert.strictEqual(connection.smp._pairingMode, 'none');
+      assert.strictEqual(connection.smp._pairingStage, 'idle');
+      assert.strictEqual(connection.smp._pairingTimer, null);
+    });
+
+    it('should reject malformed and invalid public keys', function() {
+      const malformed = newConnection(officialAddressOptions);
+
+      startLiveSc(malformed);
+      emitSmp(malformed, Buffer.alloc(64, 0x0c));
+
+      assert.deepStrictEqual(
+        lastWrite(malformed),
+        Buffer.from([0x05, 0x0a])
+      );
+
+      const offCurve = newConnection(officialAddressOptions);
+      const invalidPublicKey = Buffer.alloc(65);
+
+      invalidPublicKey[0] = 0x0c;
+      startLiveSc(offCurve);
+
+      const privateKey =
+        offCurve.smp._scKeyExchange.localPrivateKey;
+
+      emitSmp(offCurve, invalidPublicKey);
+
+      assert.deepStrictEqual(
+        lastWrite(offCurve),
+        Buffer.from([0x05, 0x0b])
+      );
+      assertZeroed(privateKey);
+      assert.strictEqual(offCurve.smp._scKeyExchange, null);
+      assert.strictEqual(offCurve.smp._pairingMode, 'none');
+    });
+
+    it('should reject duplicate and out-of-order SC commands', function() {
+      const randomBeforePublic =
+        newConnection(officialAddressOptions);
+
+      startLiveSc(randomBeforePublic);
+      emitSmp(
+        randomBeforePublic,
+        Smp.buildPairingRandomPdu(peerNonceA)
+      );
+      assert.deepStrictEqual(
+        lastWrite(randomBeforePublic),
+        Buffer.from([0x05, 0x0a])
+      );
+
+      const peerConfirm = newConnection(officialAddressOptions);
+
+      startLiveSc(peerConfirm);
+      emitSmp(
+        peerConfirm,
+        Smp.buildPairingConfirmPdu(Buffer.alloc(16))
+      );
+      assert.deepStrictEqual(
+        lastWrite(peerConfirm),
+        Buffer.from([0x05, 0x0a])
+      );
+
+      const duplicatePublic =
+        newConnection(officialAddressOptions);
+
+      completeLivePublicKey(duplicatePublic);
+      emitSmp(
+        duplicatePublic,
+        Smp.buildPairingPublicKeyPdu(publicA)
+      );
+      assert.deepStrictEqual(
+        lastWrite(duplicatePublic),
+        Buffer.from([0x05, 0x0a])
+      );
+
+      const duplicateRandom =
+        newConnection(officialAddressOptions);
+
+      completeLiveRandom(duplicateRandom);
+      emitSmp(
+        duplicateRandom,
+        Smp.buildPairingRandomPdu(peerNonceA)
+      );
+      assert.deepStrictEqual(
+        lastWrite(duplicateRandom),
+        Buffer.from([0x05, 0x0a])
+      );
+
+      const duplicateDhKeyCheck =
+        newConnection(officialAddressOptions);
+
+      completeLiveDhKeyCheck(duplicateDhKeyCheck);
+
+      const pendingLtk =
+        duplicateDhKeyCheck.aclStream
+          .pendingScEncryptionMaterial.ltk;
+
+      emitSmp(
+        duplicateDhKeyCheck,
+        Smp.buildPairingDhKeyCheckPdu(liveExpectedEa)
+      );
+
+      assert.deepStrictEqual(
+        lastWrite(duplicateDhKeyCheck),
+        Buffer.from([0x05, 0x0a])
+      );
+      assert.strictEqual(
+        duplicateDhKeyCheck.aclStream.pendingSetCount,
+        1
+      );
+      assertZeroed(pendingLtk);
+      assert.strictEqual(
+        duplicateDhKeyCheck.aclStream
+          .pendingScEncryptionMaterial,
+        null
+      );
+    });
+
+    it('should reject DHKey Check mismatch without Legacy fallback', function() {
+      const connection = newConnection(officialAddressOptions);
+
+      completeLiveRandom(connection);
+
+      const context = connection.smp._scKeyExchange;
+      const privateKey = context.localPrivateKey;
+      const dhKey = context.dhKey;
+      const macKey = context.macKey;
+      const ltk = context.ltk;
+      const invalidEa = Buffer.from(liveExpectedEa);
+
+      invalidEa[0] ^= 0x01;
+      emitSmp(
+        connection,
+        Smp.buildPairingDhKeyCheckPdu(invalidEa)
+      );
+
+      assert.deepStrictEqual(
+        lastWrite(connection),
+        Buffer.from([0x05, 0x0b])
+      );
+      [privateKey, dhKey, macKey, ltk].forEach(assertZeroed);
+      assert.strictEqual(connection.smp._scKeyExchange, null);
+      assert.strictEqual(
+        connection.aclStream.pendingScEncryptionMaterial,
+        null
+      );
+      assert.strictEqual(
+        connection.aclStream.writes.some(function(write) {
+          return write.data.equals(
+            Buffer.from([
+              0x02, 0x03, 0x00, 0x01, 0x10, 0x00, 0x01
+            ])
+          );
+        }),
+        false
+      );
+    });
+
+    it('should handle unsupported and remote failure commands once', function() {
+      const unsupported = newConnection(officialAddressOptions);
+
+      startLiveSc(unsupported);
+      emitSmp(unsupported, Buffer.from([0x0e, 0x00]));
+
+      assert.deepStrictEqual(
+        lastWrite(unsupported),
+        Buffer.from([0x05, 0x07])
+      );
+
+      const reserved = newConnection(officialAddressOptions);
+
+      startLiveSc(reserved);
+
+      const reservedWriteCount = reserved.aclStream.writes.length;
+
+      emitSmp(reserved, Buffer.from([0x0f]));
+      emitSmp(reserved, Buffer.from([0x00]));
+
+      assert.strictEqual(
+        reserved.aclStream.writes.length,
+        reservedWriteCount
+      );
+      assert.strictEqual(
+        reserved.smp._pairingMode,
+        'secureConnections'
+      );
+
+      const remoteFailure = newConnection(officialAddressOptions);
+      let failureCount = 0;
+
+      remoteFailure.smp.on('fail', function() {
+        failureCount++;
+      });
+      startLiveSc(remoteFailure);
+
+      const privateKey =
+        remoteFailure.smp._scKeyExchange.localPrivateKey;
+      const writeCount = remoteFailure.aclStream.writes.length;
+
+      emitSmp(remoteFailure, Buffer.from([0x05, 0x04]));
+      emitSmp(remoteFailure, Buffer.from([0x05, 0x04]));
+
+      assert.strictEqual(
+        remoteFailure.aclStream.writes.length,
+        writeCount
+      );
+      assert.strictEqual(failureCount, 1);
+      assertZeroed(privateKey);
+      assert.strictEqual(remoteFailure.smp._scKeyExchange, null);
+    });
+
+    it('should not hand off LTK before Eb is queued', function() {
+      const connection = newConnection(officialAddressOptions);
+
+      completeLiveRandom(connection);
+      connection.aclStream.writeFailureIndex = 4;
+
+      emitSmp(
+        connection,
+        Smp.buildPairingDhKeyCheckPdu(liveExpectedEa)
+      );
+
+      assert.strictEqual(connection.aclStream.pendingSetCount, 0);
+      assert.strictEqual(
+        connection.aclStream.pendingScEncryptionMaterial,
+        null
+      );
+      assert.strictEqual(connection.smp._scKeyExchange, null);
+      assert.strictEqual(connection.smp._pairingMode, 'none');
+    });
+
+    it('should apply the 30-second timeout without sending a PDU', function() {
+      const connection = newConnection(officialAddressOptions);
+      let failureCount = 0;
+
+      connection.smp.on('fail', function() {
+        failureCount++;
+      });
+      startLiveSc(connection);
+
+      const privateKey =
+        connection.smp._scKeyExchange.localPrivateKey;
+      const writeCount = connection.aclStream.writes.length;
+
+      assert.strictEqual(
+        connection.smp._pairingTimer._idleTimeout,
+        30000
+      );
+
+      connection.smp.onPairingTimeout();
+
+      assert.strictEqual(
+        connection.aclStream.writes.length,
+        writeCount
+      );
+      assert.strictEqual(failureCount, 1);
+      assertZeroed(privateKey);
+      assert.strictEqual(connection.smp._scKeyExchange, null);
+      assert.strictEqual(connection.smp._pairingTimer, null);
+      assert.strictEqual(connection.smp._pairingTimedOut, true);
+
+      emitSmp(connection, livePairingRequest);
+
+      assert.strictEqual(
+        connection.aclStream.writes.length,
+        writeCount
+      );
+    });
+
+    it('should restart the timer after each outgoing SC step', function() {
+      const connection = newConnection(officialAddressOptions);
+
+      startLiveSc(connection);
+
+      const afterResponse = connection.smp._pairingTimer;
+
+      completeLivePublicKey(connection);
+
+      const afterConfirm = connection.smp._pairingTimer;
+
+      emitSmp(
+        connection,
+        Smp.buildPairingRandomPdu(peerNonceA)
+      );
+
+      const afterRandom = connection.smp._pairingTimer;
+
+      emitSmp(
+        connection,
+        Smp.buildPairingDhKeyCheckPdu(liveExpectedEa)
+      );
+
+      const afterDhKeyCheck = connection.smp._pairingTimer;
+
+      assert.notStrictEqual(afterResponse, afterConfirm);
+      assert.notStrictEqual(afterConfirm, afterRandom);
+      assert.notStrictEqual(afterRandom, afterDhKeyCheck);
+      assert.strictEqual(afterResponse._destroyed, true);
+      assert.strictEqual(afterConfirm._destroyed, true);
+      assert.strictEqual(afterRandom._destroyed, true);
+      assert.strictEqual(afterDhKeyCheck._idleTimeout, 30000);
+    });
+
+    it('should clear secrets on ACL end at every live stage', function() {
+      const stageBuilders = [
+        startLiveSc,
+        completeLivePublicKey,
+        completeLiveRandom,
+        completeLiveDhKeyCheck
+      ];
+
+      stageBuilders.forEach(function(buildStage) {
+        const connection = newConnection(officialAddressOptions);
+
+        buildStage(connection);
+
+        const context = connection.smp._scKeyExchange;
+        const sensitive = [
+          context.localPrivateKey,
+          context.dhKey,
+          context.localNonce,
+          context.peerNonce,
+          context.localConfirm,
+          context.macKey,
+          context.ltk,
+          context.localDhKeyCheck,
+          context.expectedPeerDhKeyCheck
+        ].filter(Buffer.isBuffer);
+
+        if (connection.aclStream.pendingScEncryptionMaterial) {
+          sensitive.push(
+            connection.aclStream.pendingScEncryptionMaterial.ltk
+          );
+        }
+
+        connection.aclStream.emit('end');
+
+        sensitive.forEach(assertZeroed);
+        assert.strictEqual(connection.smp._scKeyExchange, null);
+        assert.strictEqual(connection.smp._pairingTimer, null);
+        assert.strictEqual(
+          connection.aclStream.pendingScEncryptionMaterial,
+          null
+        );
+      });
+    });
+
+    it('should keep secrets out of debug output', function() {
+      const debugModule = require('debug');
+      const previousDebug = debugModule.disable();
+      const originalWrite = process.stderr.write;
+      let output = '';
+
+      process.stderr.write = function(value) {
+        output += value.toString();
+        return true;
+      };
+      debugModule.enable('smp');
+
+      try {
+        const connection = newConnection(officialAddressOptions);
+
+        completeLiveDhKeyCheck(connection);
+      } finally {
+        process.stderr.write = originalWrite;
+        debugModule.enable(previousDebug);
+      }
+
+      [
+        privateB,
+        expectedDhKey,
+        localNonceB,
+        expectedMacKey,
+        expectedLtk,
+        liveExpectedEa,
+        liveExpectedEb
+      ].forEach(function(secret) {
+        assert.strictEqual(
+          output.indexOf(secret.toString('hex')),
+          -1
+        );
+      });
+    });
+
+    it('should preserve the complete Legacy pairing sequence', function() {
+      const connection = newConnection();
+      const legacyRequest = Buffer.from([
+        0x01, 0x03, 0x00, 0x01, 0x10, 0x00, 0x01
+      ]);
+      const legacyResponse = Buffer.from([
+        0x02, 0x03, 0x00, 0x01, 0x10, 0x00, 0x01
+      ]);
+      const peerRandom = hex(
+        '00112233445566778899aabbccddeeff'
+      );
+      const localRandom = hex(
+        'ffeeddccbbaa99887766554433221100'
+      );
+      const tk = Buffer.alloc(16);
+      const mgmtCallCount = mgmtCalls.length;
+
+      emitSmp(connection, legacyRequest);
+
+      const peerConfirm = bluetoothCrypto.c1(
+        tk,
+        peerRandom,
+        legacyResponse,
+        legacyRequest,
+        connection.smp._iat,
+        connection.smp._ia,
+        connection.smp._rat,
+        connection.smp._ra
+      );
+      const expectedLocalConfirm = bluetoothCrypto.c1(
+        tk,
+        localRandom,
+        legacyResponse,
+        legacyRequest,
+        connection.smp._iat,
+        connection.smp._ia,
+        connection.smp._rat,
+        connection.smp._ra
+      );
+      const expectedStk = bluetoothCrypto.s1(
+        tk,
+        localRandom,
+        peerRandom
+      );
+      const originalR = bluetoothCrypto.r;
+
+      bluetoothCrypto.r = function() {
+        return Buffer.from(localRandom);
+      };
+
+      try {
+        emitSmp(
+          connection,
+          Buffer.concat([
+            Buffer.from([0x03]),
+            peerConfirm
+          ])
+        );
+      } finally {
+        bluetoothCrypto.r = originalR;
+      }
+
+      emitSmp(
+        connection,
+        Buffer.concat([
+          Buffer.from([0x04]),
+          peerRandom
+        ])
+      );
+
+      assert.deepStrictEqual(
+        connection.aclStream.writes.map(function(write) {
+          return write.data;
+        }),
+        [
+          legacyResponse,
+          Buffer.concat([
+            Buffer.from([0x03]),
+            expectedLocalConfirm
+          ]),
+          Buffer.concat([
+            Buffer.from([0x04]),
+            localRandom
+          ])
+        ]
+      );
+      assert.strictEqual(mgmtCalls.length, mgmtCallCount + 1);
+      assert.strictEqual(connection.smp._scKeyExchange, null);
+
+      connection.aclStream.emit('encryptChange', true);
+
+      assert.deepStrictEqual(
+        connection.aclStream.writes.slice(3).map(function(write) {
+          return write.data;
+        }),
+        [
+          Buffer.concat([
+            Buffer.from([0x06]),
+            expectedStk
+          ]),
+          Buffer.from([
+            0x07,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00
+          ])
+        ]
+      );
+      assert.strictEqual(connection.smp._pairingMode, 'none');
+      assert.strictEqual(connection.smp._pairingTimer, null);
     });
   });
 });
