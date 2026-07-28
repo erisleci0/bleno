@@ -1,6 +1,7 @@
 /* jshint mocha: true */
 
 const assert = require('assert');
+const nodeCrypto = require('crypto');
 const { EventEmitter } = require('events');
 
 const bluetoothCrypto = require('../lib/hci-socket/crypto');
@@ -38,7 +39,9 @@ function hex(value) {
   return Buffer.from(value.replace(/\s/g, ''), 'hex');
 }
 
-function createSmp() {
+function createSmp(options) {
+  options = options || {};
+
   const aclStream = new EventEmitter();
 
   aclStream.writes = [];
@@ -53,10 +56,10 @@ function createSmp() {
     aclStream,
     smp: new Smp(
       aclStream,
-      'public',
-      '00:11:22:33:44:55',
-      'public',
-      'aa:bb:cc:dd:ee:ff'
+      options.localAddressType || 'public',
+      options.localAddress || '00:11:22:33:44:55',
+      options.remoteAddressType || 'public',
+      options.remoteAddress || 'aa:bb:cc:dd:ee:ff'
     )
   };
 }
@@ -313,6 +316,36 @@ describe('HCI socket SMP ephemeral key exchange', function() {
   );
   const peerNonceA = hex('d5cb8454d177733effffb2ec712baeab');
   const localNonceB = hex('a6e8e7cc25a75f6e216583f7ff3dc4cf');
+  const expectedMacKey =
+    hex('2965f176a1084a02fd3f6a20ce636e20');
+  const expectedLtk =
+    hex('6986791169d7cd23980522b594750a38');
+  const initiatorAddress = hex('0056123737bfce');
+  const responderAddress = hex('00a713702dcfc1');
+  const pairingRequest = Buffer.from([
+    0x01,
+    0x02, // IO capability
+    0x00, // OOB data flag
+    0x05, // AuthReq
+    0x10,
+    0x00,
+    0x00
+  ]);
+  const pairingResponse = Buffer.from([
+    0x02,
+    0x03, // IO capability
+    0x00, // OOB data flag
+    0x01, // AuthReq
+    0x10,
+    0x00,
+    0x00
+  ]);
+  const officialAddressOptions = {
+    localAddressType: 'public',
+    localAddress: 'a7:13:70:2d:cf:c1',
+    remoteAddressType: 'public',
+    remoteAddress: '56:12:37:37:bf:ce'
+  };
   let connections;
 
   beforeEach(function() {
@@ -325,8 +358,8 @@ describe('HCI socket SMP ephemeral key exchange', function() {
     });
   });
 
-  function newConnection() {
-    const connection = createSmp();
+  function newConnection(options) {
+    const connection = createSmp(options);
     connections.push(connection);
     return connection;
   }
@@ -346,6 +379,14 @@ describe('HCI socket SMP ephemeral key exchange', function() {
       Smp.buildPairingRandomPdu(peerNonceA)
     );
     connection.smp.buildScRandomPdu();
+  }
+
+  function completeDhKeyMaterial(connection) {
+    completeConfirmRandom(connection);
+    connection.smp.deriveScKeyMaterial(
+      pairingRequest,
+      pairingResponse
+    );
   }
 
   it('should initialize with an empty context', function() {
@@ -947,5 +988,422 @@ describe('HCI socket SMP ephemeral key exchange', function() {
 
     assert.strictEqual(connectionA.aclStream.writes.length, 0);
     assert.strictEqual(connectionB.aclStream.writes.length, 0);
+  });
+
+  describe('DHKey Check foundation', function() {
+    // Bluetooth Core Specification Amended 4.2,
+    // Vol 3, Part H, Appendix D.3.
+    it('should match the official f5 vector', function() {
+      assert.deepStrictEqual(
+        bluetoothCrypto.f5(
+          expectedDhKey,
+          peerNonceA,
+          localNonceB,
+          initiatorAddress,
+          responderAddress
+        ),
+        {
+          macKey: expectedMacKey,
+          ltk: expectedLtk
+        }
+      );
+    });
+
+    // Bluetooth Core Specification Amended 4.2,
+    // Vol 3, Part H, Appendix D.4.
+    it('should match the official f6 vector', function() {
+      assert.deepStrictEqual(
+        bluetoothCrypto.f6(
+          expectedMacKey,
+          peerNonceA,
+          localNonceB,
+          hex('12a3343bb453bb5408da42d20c2d0fc8'),
+          hex('010102'),
+          initiatorAddress,
+          responderAddress
+        ),
+        hex('e3c473989cd0e8c5d26c0b09da958f61')
+      );
+    });
+
+    it('should derive responder MacKey, LTK, Ea, and Eb', function() {
+      const connection = newConnection(officialAddressOptions);
+      const callerRequest = Buffer.from(pairingRequest);
+      const callerResponse = Buffer.from(pairingResponse);
+      const originalRequest = Buffer.from(callerRequest);
+      const originalResponse = Buffer.from(callerResponse);
+
+      completeConfirmRandom(connection);
+      connection.smp.deriveScKeyMaterial(
+        callerRequest,
+        callerResponse
+      );
+
+      const context = connection.smp._scKeyExchange;
+      const zeroR = Buffer.alloc(16);
+      const expectedEa = bluetoothCrypto.f6(
+        expectedMacKey,
+        peerNonceA,
+        localNonceB,
+        zeroR,
+        hex('050002'),
+        initiatorAddress,
+        responderAddress
+      );
+      const expectedEb = bluetoothCrypto.f6(
+        expectedMacKey,
+        localNonceB,
+        peerNonceA,
+        zeroR,
+        hex('010003'),
+        responderAddress,
+        initiatorAddress
+      );
+
+      assert.deepStrictEqual(context.macKey, expectedMacKey);
+      assert.deepStrictEqual(context.ltk, expectedLtk);
+      assert.deepStrictEqual(context.expectedPeerDhKeyCheck, expectedEa);
+      assert.deepStrictEqual(context.localDhKeyCheck, expectedEb);
+      assert.strictEqual(
+        context.confirmRandomStage,
+        'dhKeyMaterialReady'
+      );
+      assert.deepStrictEqual(callerRequest, originalRequest);
+      assert.deepStrictEqual(callerResponse, originalResponse);
+    });
+
+    it('should verify Ea in constant time before exposing Eb', function() {
+      const connection = newConnection(officialAddressOptions);
+      const originalTimingSafeEqual = nodeCrypto.timingSafeEqual;
+      let comparisonCount = 0;
+      let firstComparedValue;
+      let secondComparedValue;
+
+      completeDhKeyMaterial(connection);
+
+      const expectedEa =
+        connection.smp._scKeyExchange.expectedPeerDhKeyCheck;
+      const expectedEb = Buffer.from(
+        connection.smp._scKeyExchange.localDhKeyCheck
+      );
+      const peerPdu = Smp.buildPairingDhKeyCheckPdu(expectedEa);
+      const originalPeerPdu = Buffer.from(peerPdu);
+
+      nodeCrypto.timingSafeEqual = function(first, second) {
+        comparisonCount++;
+        firstComparedValue = Buffer.from(first);
+        secondComparedValue = Buffer.from(second);
+        return originalTimingSafeEqual(first, second);
+      };
+
+      try {
+        connection.smp.processScDhKeyCheckPdu(peerPdu);
+      } finally {
+        nodeCrypto.timingSafeEqual = originalTimingSafeEqual;
+      }
+
+      assert.strictEqual(comparisonCount, 1);
+      assert.deepStrictEqual(firstComparedValue, secondComparedValue);
+      assertZeroed(expectedEa);
+      assert.strictEqual(
+        connection.smp._scKeyExchange.expectedPeerDhKeyCheck,
+        null
+      );
+      assert.strictEqual(
+        connection.smp._scKeyExchange.confirmRandomStage,
+        'peerDhKeyCheckVerified'
+      );
+      assert.deepStrictEqual(peerPdu, originalPeerPdu);
+
+      const localPdu = connection.smp.buildScDhKeyCheckPdu();
+      const originalLocalCheck = Buffer.from(
+        connection.smp._scKeyExchange.localDhKeyCheck
+      );
+
+      assert.deepStrictEqual(
+        Smp.parsePairingDhKeyCheckPdu(localPdu),
+        expectedEb
+      );
+      assert.deepStrictEqual(
+        localPdu.slice(1),
+        Buffer.from(expectedEb).reverse()
+      );
+      assert.strictEqual(
+        connection.smp._scKeyExchange.confirmRandomStage,
+        'dhKeyCheckComplete'
+      );
+
+      localPdu.fill(0);
+
+      assert.deepStrictEqual(
+        connection.smp._scKeyExchange.localDhKeyCheck,
+        originalLocalCheck
+      );
+    });
+
+    it('should reject a mismatched Ea and clear the context', function() {
+      const connection = newConnection(officialAddressOptions);
+
+      completeDhKeyMaterial(connection);
+
+      const context = connection.smp._scKeyExchange;
+      const privateKey = context.localPrivateKey;
+      const dhKey = context.dhKey;
+      const localNonce = context.localNonce;
+      const peerNonce = context.peerNonce;
+      const localConfirm = context.localConfirm;
+      const macKey = context.macKey;
+      const ltk = context.ltk;
+      const localDhKeyCheck = context.localDhKeyCheck;
+      const expectedEa = context.expectedPeerDhKeyCheck;
+      const peerPdu = Smp.buildPairingDhKeyCheckPdu(expectedEa);
+
+      peerPdu[1] ^= 0x01;
+      const originalPeerPdu = Buffer.from(peerPdu);
+
+      assert.throws(function() {
+        connection.smp.processScDhKeyCheckPdu(peerPdu);
+      }, /does not match/);
+
+      assert.deepStrictEqual(peerPdu, originalPeerPdu);
+      [
+        privateKey,
+        dhKey,
+        localNonce,
+        peerNonce,
+        localConfirm,
+        macKey,
+        ltk,
+        localDhKeyCheck,
+        expectedEa
+      ].forEach(assertZeroed);
+      assert.strictEqual(connection.smp._scKeyExchange, null);
+    });
+
+    it('should reject duplicate and out-of-order DHKey Checks', function() {
+      const beforeConfirmComplete =
+        newConnection(officialAddressOptions);
+
+      completeKeyExchange(beforeConfirmComplete, privateB, publicA);
+
+      assert.throws(function() {
+        beforeConfirmComplete.smp.deriveScKeyMaterial(
+          pairingRequest,
+          pairingResponse
+        );
+      }, /Confirm and Random is not complete/);
+      assert.strictEqual(beforeConfirmComplete.smp._scKeyExchange, null);
+
+      const localBeforePeer = newConnection(officialAddressOptions);
+
+      completeDhKeyMaterial(localBeforePeer);
+
+      assert.throws(function() {
+        localBeforePeer.smp.buildScDhKeyCheckPdu();
+      }, /not ready/);
+      assert.strictEqual(localBeforePeer.smp._scKeyExchange, null);
+
+      const duplicatePeer = newConnection(officialAddressOptions);
+
+      completeDhKeyMaterial(duplicatePeer);
+
+      const peerPdu = Smp.buildPairingDhKeyCheckPdu(
+        duplicatePeer.smp._scKeyExchange.expectedPeerDhKeyCheck
+      );
+
+      duplicatePeer.smp.processScDhKeyCheckPdu(peerPdu);
+
+      assert.throws(function() {
+        duplicatePeer.smp.processScDhKeyCheckPdu(peerPdu);
+      }, /not expected/);
+      assert.strictEqual(duplicatePeer.smp._scKeyExchange, null);
+    });
+
+    it('should strictly validate pairing and DHKey Check PDUs', function() {
+      const invalidPairingType =
+        newConnection(officialAddressOptions);
+
+      completeConfirmRandom(invalidPairingType);
+
+      assert.throws(function() {
+        invalidPairingType.smp.deriveScKeyMaterial(
+          'not a Buffer',
+          pairingResponse
+        );
+      }, TypeError);
+      assert.strictEqual(invalidPairingType.smp._scKeyExchange, null);
+
+      const invalidPairingLength =
+        newConnection(officialAddressOptions);
+
+      completeConfirmRandom(invalidPairingLength);
+
+      assert.throws(function() {
+        invalidPairingLength.smp.deriveScKeyMaterial(
+          Buffer.alloc(6),
+          pairingResponse
+        );
+      }, RangeError);
+      assert.strictEqual(invalidPairingLength.smp._scKeyExchange, null);
+
+      const invalidPairingOpcode =
+        newConnection(officialAddressOptions);
+
+      completeConfirmRandom(invalidPairingOpcode);
+
+      assert.throws(function() {
+        invalidPairingOpcode.smp.deriveScKeyMaterial(
+          Buffer.from(pairingResponse),
+          pairingResponse
+        );
+      }, RangeError);
+      assert.strictEqual(invalidPairingOpcode.smp._scKeyExchange, null);
+
+      const invalidCheck = newConnection(officialAddressOptions);
+
+      completeDhKeyMaterial(invalidCheck);
+
+      assert.throws(function() {
+        invalidCheck.smp.processScDhKeyCheckPdu('not a Buffer');
+      }, TypeError);
+      assert.strictEqual(invalidCheck.smp._scKeyExchange, null);
+
+      const invalidCheckLength =
+        newConnection(officialAddressOptions);
+
+      completeDhKeyMaterial(invalidCheckLength);
+
+      assert.throws(function() {
+        invalidCheckLength.smp.processScDhKeyCheckPdu(
+          Buffer.alloc(16)
+        );
+      }, RangeError);
+      assert.strictEqual(invalidCheckLength.smp._scKeyExchange, null);
+
+      const invalidCheckOpcode =
+        newConnection(officialAddressOptions);
+
+      completeDhKeyMaterial(invalidCheckOpcode);
+
+      const invalidPdu = Smp.buildPairingDhKeyCheckPdu(
+        invalidCheckOpcode.smp._scKeyExchange
+          .expectedPeerDhKeyCheck
+      );
+
+      invalidPdu[0] = 0x0c;
+
+      assert.throws(function() {
+        invalidCheckOpcode.smp.processScDhKeyCheckPdu(invalidPdu);
+      }, RangeError);
+      assert.strictEqual(invalidCheckOpcode.smp._scKeyExchange, null);
+    });
+
+    it('should clear Phase 3D secrets after success and reset', function() {
+      const connection = newConnection(officialAddressOptions);
+
+      completeDhKeyMaterial(connection);
+
+      const expectedEa =
+        connection.smp._scKeyExchange.expectedPeerDhKeyCheck;
+      const peerPdu = Smp.buildPairingDhKeyCheckPdu(expectedEa);
+
+      connection.smp.processScDhKeyCheckPdu(peerPdu);
+
+      const context = connection.smp._scKeyExchange;
+      const privateKey = context.localPrivateKey;
+      const dhKey = context.dhKey;
+      const localNonce = context.localNonce;
+      const peerNonce = context.peerNonce;
+      const localConfirm = context.localConfirm;
+      const macKey = context.macKey;
+      const ltk = context.ltk;
+      const localDhKeyCheck = context.localDhKeyCheck;
+
+      connection.smp.buildScDhKeyCheckPdu();
+      connection.smp.resetScKeyExchange();
+
+      [
+        privateKey,
+        dhKey,
+        localNonce,
+        peerNonce,
+        localConfirm,
+        macKey,
+        ltk,
+        localDhKeyCheck,
+        expectedEa
+      ].forEach(assertZeroed);
+      assert.strictEqual(connection.smp._scKeyExchange, null);
+
+      connection.smp.resetScKeyExchange();
+
+      assert.strictEqual(connection.smp._scKeyExchange, null);
+    });
+
+    it('should clear Phase 3D secrets when the ACL stream ends', function() {
+      const connection = newConnection(officialAddressOptions);
+
+      completeDhKeyMaterial(connection);
+
+      const context = connection.smp._scKeyExchange;
+      const macKey = context.macKey;
+      const ltk = context.ltk;
+      const localDhKeyCheck = context.localDhKeyCheck;
+      const expectedEa = context.expectedPeerDhKeyCheck;
+
+      connection.aclStream.emit('end');
+
+      [
+        macKey,
+        ltk,
+        localDhKeyCheck,
+        expectedEa
+      ].forEach(assertZeroed);
+      assert.strictEqual(connection.smp._scKeyExchange, null);
+    });
+
+    it('should keep Phase 3D internal and Legacy Pairing unchanged', function() {
+      const internalConnection =
+        newConnection(officialAddressOptions);
+
+      completeDhKeyMaterial(internalConnection);
+
+      const peerPdu = Smp.buildPairingDhKeyCheckPdu(
+        internalConnection.smp._scKeyExchange.expectedPeerDhKeyCheck
+      );
+
+      internalConnection.smp.processScDhKeyCheckPdu(peerPdu);
+      internalConnection.smp.buildScDhKeyCheckPdu();
+
+      assert.strictEqual(internalConnection.aclStream.writes.length, 0);
+
+      const legacyConnection = newConnection();
+      const legacyRequest = Buffer.from([
+        0x01,
+        0x03,
+        0x00,
+        0x01,
+        0x10,
+        0x00,
+        0x01
+      ]);
+
+      legacyConnection.aclStream.emit('data', 0x0006, legacyRequest);
+
+      assert.strictEqual(legacyConnection.aclStream.writes.length, 1);
+      assert.deepStrictEqual(
+        legacyConnection.aclStream.writes[0].data,
+        Buffer.from([
+          0x02,
+          0x03,
+          0x00,
+          0x01,
+          0x10,
+          0x00,
+          0x01
+        ])
+      );
+      assert.strictEqual(legacyConnection.smp._scKeyExchange, null);
+    });
   });
 });
