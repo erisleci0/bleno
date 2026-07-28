@@ -347,10 +347,19 @@ describe('HCI socket ACL stream security state', function() {
     const material = createScEncryptionMaterial();
     const originalLtk = Buffer.from(material.ltk);
 
+    assert.strictEqual(
+      aclStream.hasPendingScEncryptionMaterial(),
+      false
+    );
+
     aclStream.setPendingScEncryptionMaterial(material);
 
     const storedLtk = aclStream._pendingScEncryptionMaterial.ltk;
 
+    assert.strictEqual(
+      aclStream.hasPendingScEncryptionMaterial(),
+      true
+    );
     assert.notStrictEqual(storedLtk, material.ltk);
 
     material.ltk.fill(0);
@@ -370,6 +379,10 @@ describe('HCI socket ACL stream security state', function() {
       aclStream._pendingScEncryptionMaterial.keySize,
       16
     );
+    assert.strictEqual(
+      aclStream.hasPendingScEncryptionMaterial(),
+      true
+    );
     assert.throws(function() {
       aclStream.takePendingScLtk();
     }, /already been taken/);
@@ -384,6 +397,10 @@ describe('HCI socket ACL stream security state', function() {
       keySize: 16
     });
     assert.strictEqual(aclStream._pendingScEncryptionMaterial, null);
+    assert.strictEqual(
+      aclStream.hasPendingScEncryptionMaterial(),
+      false
+    );
   });
 
   it('should reject duplicate pending SC material', function() {
