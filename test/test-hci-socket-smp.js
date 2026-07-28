@@ -51,6 +51,31 @@ function createSmp(options) {
       data: Buffer.from(data)
     });
   };
+  aclStream.pendingScEncryptionMaterial = null;
+  aclStream.setPendingScEncryptionMaterial = function(material) {
+    if (this.pendingScEncryptionMaterial) {
+      throw new Error('SC encryption material is already pending');
+    }
+
+    this.pendingScEncryptionMaterial = {
+      ltk: Buffer.from(material.ltk),
+      secureConnections: material.secureConnections,
+      authenticated: material.authenticated,
+      bonded: material.bonded,
+      keySize: material.keySize
+    };
+  };
+  aclStream.clearPendingScEncryptionMaterial = function() {
+    if (!this.pendingScEncryptionMaterial) {
+      return;
+    }
+
+    if (this.pendingScEncryptionMaterial.ltk) {
+      this.pendingScEncryptionMaterial.ltk.fill(0);
+    }
+
+    this.pendingScEncryptionMaterial = null;
+  };
 
   return {
     aclStream,
@@ -381,12 +406,27 @@ describe('HCI socket SMP ephemeral key exchange', function() {
     connection.smp.buildScRandomPdu();
   }
 
-  function completeDhKeyMaterial(connection) {
+  function completeDhKeyMaterial(
+    connection,
+    request,
+    response
+  ) {
     completeConfirmRandom(connection);
     connection.smp.deriveScKeyMaterial(
-      pairingRequest,
-      pairingResponse
+      request || pairingRequest,
+      response || pairingResponse
     );
+  }
+
+  function completeDhKeyCheck(connection, request, response) {
+    completeDhKeyMaterial(connection, request, response);
+
+    const peerPdu = Smp.buildPairingDhKeyCheckPdu(
+      connection.smp._scKeyExchange.expectedPeerDhKeyCheck
+    );
+
+    connection.smp.processScDhKeyCheckPdu(peerPdu);
+    connection.smp.buildScDhKeyCheckPdu();
   }
 
   it('should initialize with an empty context', function() {
@@ -1062,6 +1102,7 @@ describe('HCI socket SMP ephemeral key exchange', function() {
 
       assert.deepStrictEqual(context.macKey, expectedMacKey);
       assert.deepStrictEqual(context.ltk, expectedLtk);
+      assert.strictEqual(context.keySize, 16);
       assert.deepStrictEqual(context.expectedPeerDhKeyCheck, expectedEa);
       assert.deepStrictEqual(context.localDhKeyCheck, expectedEb);
       assert.strictEqual(
@@ -1404,6 +1445,211 @@ describe('HCI socket SMP ephemeral key exchange', function() {
         ])
       );
       assert.strictEqual(legacyConnection.smp._scKeyExchange, null);
+    });
+  });
+
+  describe('LTK handoff foundation', function() {
+    it('should negotiate key size and mask the MSO-first LTK', function() {
+      const connection = newConnection(officialAddressOptions);
+      const request = Buffer.from(pairingRequest);
+      const response = Buffer.from(pairingResponse);
+      const originalRequest = Buffer.from(request);
+      const originalResponse = Buffer.from(response);
+      const expectedMaskedLtk = Buffer.from(expectedLtk);
+
+      request[4] = 12;
+      response[4] = 9;
+      originalRequest[4] = 12;
+      originalResponse[4] = 9;
+      expectedMaskedLtk.fill(0, 0, 7);
+
+      completeDhKeyMaterial(connection, request, response);
+
+      assert.strictEqual(connection.smp._scKeyExchange.keySize, 9);
+      assert.deepStrictEqual(
+        connection.smp._scKeyExchange.ltk,
+        expectedMaskedLtk
+      );
+      assert.deepStrictEqual(request, originalRequest);
+      assert.deepStrictEqual(response, originalResponse);
+    });
+
+    it('should reject invalid negotiated key sizes', function() {
+      const invalidRequest =
+        newConnection(officialAddressOptions);
+      const shortRequest = Buffer.from(pairingRequest);
+
+      shortRequest[4] = 6;
+      completeConfirmRandom(invalidRequest);
+
+      assert.throws(function() {
+        invalidRequest.smp.deriveScKeyMaterial(
+          shortRequest,
+          pairingResponse
+        );
+      }, RangeError);
+      assert.strictEqual(invalidRequest.smp._scKeyExchange, null);
+
+      const invalidResponse =
+        newConnection(officialAddressOptions);
+      const longResponse = Buffer.from(pairingResponse);
+
+      longResponse[4] = 17;
+      completeConfirmRandom(invalidResponse);
+
+      assert.throws(function() {
+        invalidResponse.smp.deriveScKeyMaterial(
+          pairingRequest,
+          longResponse
+        );
+      }, RangeError);
+      assert.strictEqual(invalidResponse.smp._scKeyExchange, null);
+    });
+
+    it('should allow handoff only after DHKey Check completion', function() {
+      const withoutContext = newConnection(officialAddressOptions);
+
+      assert.throws(function() {
+        withoutContext.smp.handoffScEncryptionMaterial();
+      }, /not ready/);
+
+      const beforeDhKeyCheck =
+        newConnection(officialAddressOptions);
+
+      completeDhKeyMaterial(beforeDhKeyCheck);
+
+      assert.throws(function() {
+        beforeDhKeyCheck.smp.handoffScEncryptionMaterial();
+      }, /not ready/);
+      assert.strictEqual(beforeDhKeyCheck.smp._scKeyExchange, null);
+      assert.strictEqual(
+        beforeDhKeyCheck.aclStream.pendingScEncryptionMaterial,
+        null
+      );
+    });
+
+    it('should hand off an owned LTK copy only once', function() {
+      const connection = newConnection(officialAddressOptions);
+
+      completeDhKeyCheck(connection);
+
+      const sourceLtk = connection.smp._scKeyExchange.ltk;
+      const originalLtk = Buffer.from(sourceLtk);
+
+      assert.strictEqual(
+        connection.smp._scKeyExchange.confirmRandomStage,
+        'dhKeyCheckComplete'
+      );
+
+      connection.smp.handoffScEncryptionMaterial();
+
+      const pending =
+        connection.aclStream.pendingScEncryptionMaterial;
+
+      assertZeroed(sourceLtk);
+      assert.strictEqual(connection.smp._scKeyExchange.ltk, null);
+      assert.strictEqual(
+        connection.smp._scKeyExchange.confirmRandomStage,
+        'ltkHandedOff'
+      );
+      assert.notStrictEqual(pending.ltk, sourceLtk);
+      assert.deepStrictEqual(pending, {
+        ltk: originalLtk,
+        secureConnections: true,
+        authenticated: false,
+        bonded: false,
+        keySize: 16
+      });
+      assert.strictEqual(connection.aclStream.writes.length, 0);
+
+      const pendingLtk = pending.ltk;
+
+      assert.throws(function() {
+        connection.smp.handoffScEncryptionMaterial();
+      }, /not ready/);
+      assertZeroed(pendingLtk);
+      assert.strictEqual(connection.smp._scKeyExchange, null);
+      assert.strictEqual(
+        connection.aclStream.pendingScEncryptionMaterial,
+        null
+      );
+    });
+
+    it('should clear local secrets when handoff fails', function() {
+      const connection = newConnection(officialAddressOptions);
+
+      completeDhKeyCheck(connection);
+
+      const sourceLtk = connection.smp._scKeyExchange.ltk;
+      const privateKey =
+        connection.smp._scKeyExchange.localPrivateKey;
+
+      connection.aclStream.setPendingScEncryptionMaterial =
+        function() {
+          throw new Error('pending storage failed');
+        };
+
+      assert.throws(function() {
+        connection.smp.handoffScEncryptionMaterial();
+      }, /pending storage failed/);
+      assertZeroed(sourceLtk);
+      assertZeroed(privateKey);
+      assert.strictEqual(connection.smp._scKeyExchange, null);
+    });
+
+    it('should clear pending LTK on reset, failure, and ACL end', function() {
+      const resetConnection =
+        newConnection(officialAddressOptions);
+
+      completeDhKeyCheck(resetConnection);
+      resetConnection.smp.handoffScEncryptionMaterial();
+
+      const resetLtk =
+        resetConnection.aclStream.pendingScEncryptionMaterial.ltk;
+
+      resetConnection.smp.resetScKeyExchange();
+
+      assertZeroed(resetLtk);
+      assert.strictEqual(
+        resetConnection.aclStream.pendingScEncryptionMaterial,
+        null
+      );
+
+      const failedConnection =
+        newConnection(officialAddressOptions);
+
+      completeDhKeyCheck(failedConnection);
+      failedConnection.smp.handoffScEncryptionMaterial();
+
+      const failedLtk =
+        failedConnection.aclStream.pendingScEncryptionMaterial.ltk;
+
+      failedConnection.smp.handlePairingFailed(
+        Buffer.from([0x05, 0x08])
+      );
+
+      assertZeroed(failedLtk);
+      assert.strictEqual(
+        failedConnection.aclStream.pendingScEncryptionMaterial,
+        null
+      );
+
+      const endedConnection =
+        newConnection(officialAddressOptions);
+
+      completeDhKeyCheck(endedConnection);
+      endedConnection.smp.handoffScEncryptionMaterial();
+
+      const endedLtk =
+        endedConnection.aclStream.pendingScEncryptionMaterial.ltk;
+
+      endedConnection.aclStream.emit('end');
+
+      assertZeroed(endedLtk);
+      assert.strictEqual(
+        endedConnection.aclStream.pendingScEncryptionMaterial,
+        null
+      );
     });
   });
 });
