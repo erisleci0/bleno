@@ -1,6 +1,9 @@
 /* jshint mocha: true */
 
 const assert = require('assert');
+const { EventEmitter } = require('events');
+
+const bluetoothCrypto = require('../lib/hci-socket/crypto');
 
 const smpPath = require.resolve('../lib/hci-socket/smp');
 const mgmtPath = require.resolve('../lib/hci-socket/mgmt');
@@ -12,7 +15,9 @@ require.cache[mgmtPath] = {
   id: mgmtPath,
   filename: mgmtPath,
   loaded: true,
-  exports: {}
+  exports: {
+    addLongTermKey: function() {}
+  }
 };
 
 const Smp = require(smpPath);
@@ -31,6 +36,33 @@ if (cachedSmp) {
 
 function hex(value) {
   return Buffer.from(value.replace(/\s/g, ''), 'hex');
+}
+
+function createSmp() {
+  const aclStream = new EventEmitter();
+
+  aclStream.writes = [];
+  aclStream.write = function(cid, data) {
+    this.writes.push({
+      cid,
+      data: Buffer.from(data)
+    });
+  };
+
+  return {
+    aclStream,
+    smp: new Smp(
+      aclStream,
+      'public',
+      '00:11:22:33:44:55',
+      'public',
+      'aa:bb:cc:dd:ee:ff'
+    )
+  };
+}
+
+function assertZeroed(value) {
+  assert.strictEqual(value.equals(Buffer.alloc(value.length)), true);
 }
 
 describe('HCI socket SMP wire format', function() {
@@ -199,5 +231,375 @@ describe('HCI socket SMP wire format', function() {
     });
     assert.deepStrictEqual(publicKeyPdu, originalPublicKeyPdu);
     assert.deepStrictEqual(dhKeyCheckPdu, originalDhKeyCheckPdu);
+  });
+});
+
+describe('HCI socket SMP ephemeral key exchange', function() {
+  const privateA = hex(
+    '3f49f6d4a3c55f3874c9b3e3d2103f50' +
+    '4aff607beb40b7995899b8a6cd3c1abd'
+  );
+  const publicA = hex(
+    '20b003d2f297be2c5e2c83a7e9f9a5b9' +
+    'eff49111acf4fddbcc0301480e359de6' +
+    'dc809c49652aeb6d63329abf5a52155c' +
+    '766345c28fed3024741c8ed01589d28b'
+  );
+  const privateB = hex(
+    '55188b3d32f6bb9a900afcfbeed4e72a' +
+    '59cb9ac2f19d7cfb6b4fdd49f47fc5fd'
+  );
+  const publicB = hex(
+    '1ea1f0f01faf1d9609592284f19e4c00' +
+    '47b58afd8615a69f559077b22faaa190' +
+    '4c55f33e429dad377356703a9ab85160' +
+    '472d1130e28e36765f89aff915b1214a'
+  );
+  const expectedDhKey = hex(
+    'ec0234a357c8ad05341010a60a397d9b' +
+    '99796b13b4f866f1868d34f373bfa698'
+  );
+  let connections;
+
+  beforeEach(function() {
+    connections = [];
+  });
+
+  afterEach(function() {
+    connections.forEach(function(connection) {
+      connection.aclStream.emit('end');
+    });
+  });
+
+  function newConnection() {
+    const connection = createSmp();
+    connections.push(connection);
+    return connection;
+  }
+
+  function completeKeyExchange(connection, localPrivateKey, peerPublicKey) {
+    connection.smp.startScKeyExchange(localPrivateKey);
+    connection.smp.processScPublicKeyPdu(
+      Smp.buildPairingPublicKeyPdu(peerPublicKey)
+    );
+  }
+
+  it('should initialize with an empty context', function() {
+    const connection = newConnection();
+
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+    assert.strictEqual(connection.aclStream.writes.length, 0);
+  });
+
+  it('should generate a valid fresh local key pair', function() {
+    const connection = newConnection();
+    const result = connection.smp.startScKeyExchange();
+    const firstPrivateKey =
+      connection.smp._scKeyExchange.localPrivateKey;
+
+    assert.strictEqual(result, undefined);
+    assert.strictEqual(firstPrivateKey.length, 32);
+    assert.strictEqual(
+      connection.smp._scKeyExchange.localPublicKey.length,
+      64
+    );
+    assert.strictEqual(
+      bluetoothCrypto.validateP256PublicKey(
+        connection.smp._scKeyExchange.localPublicKey
+      ),
+      true
+    );
+    assert.strictEqual(
+      connection.smp._scKeyExchange.peerPublicKey,
+      null
+    );
+    assert.strictEqual(connection.smp._scKeyExchange.dhKey, null);
+
+    connection.smp.startScKeyExchange();
+
+    assertZeroed(firstPrivateKey);
+    assert.strictEqual(
+      bluetoothCrypto.validateP256PublicKey(
+        connection.smp._scKeyExchange.localPublicKey
+      ),
+      true
+    );
+  });
+
+  it('should build a local Public Key PDU that round-trips', function() {
+    const connection = newConnection();
+
+    connection.smp.startScKeyExchange(privateA);
+
+    const pdu = connection.smp.buildScPublicKeyPdu();
+
+    assert.deepStrictEqual(Smp.parsePairingPublicKeyPdu(pdu), publicA);
+    assert.strictEqual(connection.aclStream.writes.length, 0);
+  });
+
+  it('should validate peer keys and derive the same expected DHKey', function() {
+    const connectionA = newConnection();
+    const connectionB = newConnection();
+
+    connectionA.smp.startScKeyExchange(privateA);
+    connectionB.smp.startScKeyExchange(privateB);
+
+    connectionA.smp.processScPublicKeyPdu(
+      connectionB.smp.buildScPublicKeyPdu()
+    );
+    connectionB.smp.processScPublicKeyPdu(
+      connectionA.smp.buildScPublicKeyPdu()
+    );
+
+    assert.deepStrictEqual(
+      connectionA.smp._scKeyExchange.peerPublicKey,
+      publicB
+    );
+    assert.deepStrictEqual(
+      connectionB.smp._scKeyExchange.peerPublicKey,
+      publicA
+    );
+    assert.strictEqual(
+      connectionA.smp._scKeyExchange.dhKey.equals(expectedDhKey),
+      true
+    );
+    assert.strictEqual(
+      connectionB.smp._scKeyExchange.dhKey.equals(expectedDhKey),
+      true
+    );
+    assert.strictEqual(
+      connectionA.smp._scKeyExchange.dhKey.equals(
+        connectionB.smp._scKeyExchange.dhKey
+      ),
+      true
+    );
+  });
+
+  it('should reject invalid public-key types and lengths', function() {
+    const connection = newConnection();
+
+    connection.smp.startScKeyExchange(privateB);
+    const firstPrivateKey =
+      connection.smp._scKeyExchange.localPrivateKey;
+
+    assert.throws(function() {
+      connection.smp.processScPublicKeyPdu('not a Buffer');
+    }, TypeError);
+    assertZeroed(firstPrivateKey);
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+
+    connection.smp.startScKeyExchange(privateB);
+    const secondPrivateKey =
+      connection.smp._scKeyExchange.localPrivateKey;
+
+    assert.throws(function() {
+      connection.smp.processScPublicKeyPdu(Buffer.alloc(64));
+    }, RangeError);
+    assertZeroed(secondPrivateKey);
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+
+    connection.smp.startScKeyExchange(privateB);
+    const thirdPrivateKey =
+      connection.smp._scKeyExchange.localPrivateKey;
+    const invalidOpcodePdu = Smp.buildPairingPublicKeyPdu(publicA);
+    invalidOpcodePdu[0] = 0x0d;
+
+    assert.throws(function() {
+      connection.smp.processScPublicKeyPdu(invalidOpcodePdu);
+    }, RangeError);
+    assertZeroed(thirdPrivateKey);
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+  });
+
+  it('should reject an off-curve peer public key', function() {
+    const connection = newConnection();
+
+    connection.smp.startScKeyExchange(privateB);
+    const privateKey = connection.smp._scKeyExchange.localPrivateKey;
+    const pdu = Smp.buildPairingPublicKeyPdu(Buffer.alloc(64));
+
+    assert.throws(function() {
+      connection.smp.processScPublicKeyPdu(pdu);
+    });
+    assertZeroed(privateKey);
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+  });
+
+  it('should reject a duplicate Public Key PDU', function() {
+    const connection = newConnection();
+    const pdu = Smp.buildPairingPublicKeyPdu(publicB);
+
+    connection.smp.startScKeyExchange(privateA);
+    connection.smp.processScPublicKeyPdu(pdu);
+
+    const privateKey = connection.smp._scKeyExchange.localPrivateKey;
+    const dhKey = connection.smp._scKeyExchange.dhKey;
+
+    assert.throws(function() {
+      connection.smp.processScPublicKeyPdu(pdu);
+    });
+    assertZeroed(privateKey);
+    assertZeroed(dhKey);
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+  });
+
+  it('should reject a matching non-debug public key', function() {
+    const connection = newConnection();
+
+    connection.smp.startScKeyExchange(privateB);
+    const privateKey = connection.smp._scKeyExchange.localPrivateKey;
+
+    assert.throws(function() {
+      connection.smp.processScPublicKeyPdu(
+        connection.smp.buildScPublicKeyPdu()
+      );
+    });
+    assertZeroed(privateKey);
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+  });
+
+  it('should allow the matching Secure Connections debug key', function() {
+    const connection = newConnection();
+
+    connection.smp.startScKeyExchange(privateA);
+    connection.smp.processScPublicKeyPdu(
+      connection.smp.buildScPublicKeyPdu()
+    );
+
+    assert.deepStrictEqual(
+      connection.smp._scKeyExchange.peerPublicKey,
+      publicA
+    );
+    assert.strictEqual(connection.smp._scKeyExchange.dhKey.length, 32);
+  });
+
+  it('should reject processing without an initialized context', function() {
+    const connection = newConnection();
+    const pdu = Smp.buildPairingPublicKeyPdu(publicA);
+
+    assert.throws(function() {
+      connection.smp.buildScPublicKeyPdu();
+    });
+    assert.throws(function() {
+      connection.smp.processScPublicKeyPdu(pdu);
+    });
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+  });
+
+  it('should protect the context from caller mutation', function() {
+    const connection = newConnection();
+    const callerPrivateKey = Buffer.from(privateB);
+    const originalPrivateKey = Buffer.from(callerPrivateKey);
+
+    connection.smp.startScKeyExchange(callerPrivateKey);
+    const localPdu = connection.smp.buildScPublicKeyPdu();
+
+    callerPrivateKey.fill(0);
+    localPdu.fill(0);
+
+    assert.strictEqual(
+      connection.smp._scKeyExchange.localPrivateKey.equals(
+        originalPrivateKey
+      ),
+      true
+    );
+    assert.deepStrictEqual(
+      connection.smp._scKeyExchange.localPublicKey,
+      publicB
+    );
+
+    const peerPdu = Smp.buildPairingPublicKeyPdu(publicA);
+
+    connection.smp.processScPublicKeyPdu(peerPdu);
+    peerPdu.fill(0);
+
+    assert.deepStrictEqual(
+      connection.smp._scKeyExchange.peerPublicKey,
+      publicA
+    );
+  });
+
+  it('should clear the previous context when a new start fails', function() {
+    const connection = newConnection();
+
+    completeKeyExchange(connection, privateB, publicA);
+
+    const privateKey = connection.smp._scKeyExchange.localPrivateKey;
+    const dhKey = connection.smp._scKeyExchange.dhKey;
+
+    assert.throws(function() {
+      connection.smp.startScKeyExchange(Buffer.alloc(32));
+    });
+
+    assertZeroed(privateKey);
+    assertZeroed(dhKey);
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+  });
+
+  it('should reset and clear secrets after successful key exchange', function() {
+    const connection = newConnection();
+
+    completeKeyExchange(connection, privateB, publicA);
+
+    const privateKey = connection.smp._scKeyExchange.localPrivateKey;
+    const dhKey = connection.smp._scKeyExchange.dhKey;
+
+    connection.smp.resetScKeyExchange();
+
+    assertZeroed(privateKey);
+    assertZeroed(dhKey);
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+  });
+
+  it('should reset and clear secrets after pairing failure', function() {
+    const connection = newConnection();
+    let failCount = 0;
+
+    completeKeyExchange(connection, privateB, publicA);
+
+    const privateKey = connection.smp._scKeyExchange.localPrivateKey;
+    const dhKey = connection.smp._scKeyExchange.dhKey;
+
+    connection.smp.on('fail', function() {
+      failCount++;
+    });
+    connection.smp.handlePairingFailed(Buffer.from([0x05, 0x08]));
+
+    assertZeroed(privateKey);
+    assertZeroed(dhKey);
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+    assert.strictEqual(failCount, 1);
+  });
+
+  it('should reset and clear secrets when the ACL stream ends', function() {
+    const connection = newConnection();
+
+    completeKeyExchange(connection, privateB, publicA);
+
+    const privateKey = connection.smp._scKeyExchange.localPrivateKey;
+    const dhKey = connection.smp._scKeyExchange.dhKey;
+
+    connection.aclStream.emit('end');
+
+    assertZeroed(privateKey);
+    assertZeroed(dhKey);
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+  });
+
+  it('should not write any PDU to the live ACL stream', function() {
+    const connectionA = newConnection();
+    const connectionB = newConnection();
+
+    connectionA.smp.startScKeyExchange(privateA);
+    connectionB.smp.startScKeyExchange(privateB);
+    connectionA.smp.processScPublicKeyPdu(
+      connectionB.smp.buildScPublicKeyPdu()
+    );
+    connectionB.smp.processScPublicKeyPdu(
+      connectionA.smp.buildScPublicKeyPdu()
+    );
+
+    assert.strictEqual(connectionA.aclStream.writes.length, 0);
+    assert.strictEqual(connectionB.aclStream.writes.length, 0);
   });
 });
