@@ -143,6 +143,24 @@ describe('HCI socket SMP wire format', function() {
     assert.deepStrictEqual(Smp.parsePairingDhKeyCheckPdu(pdu), value16);
   });
 
+  it('should build and parse a Pairing Confirm PDU', function() {
+    const pdu = Smp.buildPairingConfirmPdu(value16);
+
+    assert.strictEqual(pdu.length, 17);
+    assert.strictEqual(pdu[0], 0x03);
+    assert.deepStrictEqual(pdu.slice(1), value16Smp);
+    assert.deepStrictEqual(Smp.parsePairingConfirmPdu(pdu), value16);
+  });
+
+  it('should build and parse a Pairing Random PDU', function() {
+    const pdu = Smp.buildPairingRandomPdu(value16);
+
+    assert.strictEqual(pdu.length, 17);
+    assert.strictEqual(pdu[0], 0x04);
+    assert.deepStrictEqual(pdu.slice(1), value16Smp);
+    assert.deepStrictEqual(Smp.parsePairingRandomPdu(pdu), value16);
+  });
+
   it('should reject non-Buffer inputs', function() {
     [
       Smp.msoToSmp,
@@ -152,7 +170,11 @@ describe('HCI socket SMP wire format', function() {
       Smp.buildPairingPublicKeyPdu,
       Smp.parsePairingPublicKeyPdu,
       Smp.buildPairingDhKeyCheckPdu,
-      Smp.parsePairingDhKeyCheckPdu
+      Smp.parsePairingDhKeyCheckPdu,
+      Smp.buildPairingConfirmPdu,
+      Smp.parsePairingConfirmPdu,
+      Smp.buildPairingRandomPdu,
+      Smp.parsePairingRandomPdu
     ].forEach(function(fn) {
       assert.throws(function() {
         fn('not a Buffer');
@@ -174,7 +196,15 @@ describe('HCI socket SMP wire format', function() {
       [Smp.buildPairingDhKeyCheckPdu, 15],
       [Smp.buildPairingDhKeyCheckPdu, 17],
       [Smp.parsePairingDhKeyCheckPdu, 16],
-      [Smp.parsePairingDhKeyCheckPdu, 18]
+      [Smp.parsePairingDhKeyCheckPdu, 18],
+      [Smp.buildPairingConfirmPdu, 15],
+      [Smp.buildPairingConfirmPdu, 17],
+      [Smp.parsePairingConfirmPdu, 16],
+      [Smp.parsePairingConfirmPdu, 18],
+      [Smp.buildPairingRandomPdu, 15],
+      [Smp.buildPairingRandomPdu, 17],
+      [Smp.parsePairingRandomPdu, 16],
+      [Smp.parsePairingRandomPdu, 18]
     ].forEach(function(testCase) {
       assert.throws(function() {
         testCase[0](Buffer.alloc(testCase[1]));
@@ -191,12 +221,26 @@ describe('HCI socket SMP wire format', function() {
       Buffer.from([0x0c]),
       value16Smp
     ]);
+    const confirmPdu = Buffer.concat([
+      Buffer.from([0x04]),
+      value16Smp
+    ]);
+    const randomPdu = Buffer.concat([
+      Buffer.from([0x03]),
+      value16Smp
+    ]);
 
     assert.throws(function() {
       Smp.parsePairingPublicKeyPdu(publicKeyPdu);
     }, RangeError);
     assert.throws(function() {
       Smp.parsePairingDhKeyCheckPdu(dhKeyCheckPdu);
+    }, RangeError);
+    assert.throws(function() {
+      Smp.parsePairingConfirmPdu(confirmPdu);
+    }, RangeError);
+    assert.throws(function() {
+      Smp.parsePairingRandomPdu(randomPdu);
     }, RangeError);
   });
 
@@ -214,8 +258,12 @@ describe('HCI socket SMP wire format', function() {
     });
     const publicKeyPdu = Smp.buildPairingPublicKeyPdu(inputs[4]);
     const dhKeyCheckPdu = Smp.buildPairingDhKeyCheckPdu(inputs[0]);
+    const confirmPdu = Smp.buildPairingConfirmPdu(inputs[0]);
+    const randomPdu = Smp.buildPairingRandomPdu(inputs[0]);
     const originalPublicKeyPdu = Buffer.from(publicKeyPdu);
     const originalDhKeyCheckPdu = Buffer.from(dhKeyCheckPdu);
+    const originalConfirmPdu = Buffer.from(confirmPdu);
+    const originalRandomPdu = Buffer.from(randomPdu);
 
     Smp.msoToSmp(inputs[0]);
     Smp.smpToMso(inputs[1]);
@@ -225,12 +273,16 @@ describe('HCI socket SMP wire format', function() {
     Smp.p256PublicKeySmpToMso(inputs[5]);
     Smp.parsePairingPublicKeyPdu(publicKeyPdu);
     Smp.parsePairingDhKeyCheckPdu(dhKeyCheckPdu);
+    Smp.parsePairingConfirmPdu(confirmPdu);
+    Smp.parsePairingRandomPdu(randomPdu);
 
     inputs.forEach(function(input, index) {
       assert.deepStrictEqual(input, originals[index]);
     });
     assert.deepStrictEqual(publicKeyPdu, originalPublicKeyPdu);
     assert.deepStrictEqual(dhKeyCheckPdu, originalDhKeyCheckPdu);
+    assert.deepStrictEqual(confirmPdu, originalConfirmPdu);
+    assert.deepStrictEqual(randomPdu, originalRandomPdu);
   });
 });
 
@@ -259,6 +311,8 @@ describe('HCI socket SMP ephemeral key exchange', function() {
     'ec0234a357c8ad05341010a60a397d9b' +
     '99796b13b4f866f1868d34f373bfa698'
   );
+  const peerNonceA = hex('d5cb8454d177733effffb2ec712baeab');
+  const localNonceB = hex('a6e8e7cc25a75f6e216583f7ff3dc4cf');
   let connections;
 
   beforeEach(function() {
@@ -282,6 +336,16 @@ describe('HCI socket SMP ephemeral key exchange', function() {
     connection.smp.processScPublicKeyPdu(
       Smp.buildPairingPublicKeyPdu(peerPublicKey)
     );
+  }
+
+  function completeConfirmRandom(connection) {
+    completeKeyExchange(connection, privateB, publicA);
+    connection.smp.startScConfirmRandom(localNonceB);
+    connection.smp.buildScConfirmPdu();
+    connection.smp.processScRandomPdu(
+      Smp.buildPairingRandomPdu(peerNonceA)
+    );
+    connection.smp.buildScRandomPdu();
   }
 
   it('should initialize with an empty context', function() {
@@ -519,6 +583,260 @@ describe('HCI socket SMP ephemeral key exchange', function() {
     );
   });
 
+  // Bluetooth Core Specification, Vol 3, Part H, Appendix D.2.
+  it('should match the official f4 vector', function() {
+    const result = bluetoothCrypto.f4(
+      hex(
+        '20b003d2f297be2c5e2c83a7e9f9a5b9' +
+        'eff49111acf4fddbcc0301480e359de6'
+      ),
+      hex(
+        '55188b3d32f6bb9a900afcfbeed4e72a' +
+        '59cb9ac2f19d7cfb6b4fdd49f47fc5fd'
+      ),
+      peerNonceA,
+      Buffer.from([0x00])
+    );
+
+    assert.strictEqual(
+      result.equals(hex('f2c916f107a9bd1cf1eda1bea974872d')),
+      true
+    );
+  });
+
+  it('should generate a valid local nonce and responder confirm', function() {
+    const connection = newConnection();
+
+    completeKeyExchange(connection, privateB, publicA);
+    connection.smp.startScConfirmRandom();
+
+    const context = connection.smp._scKeyExchange;
+    const expectedConfirm = bluetoothCrypto.f4(
+      publicB.slice(0, 32),
+      publicA.slice(0, 32),
+      context.localNonce,
+      Buffer.from([0x00])
+    );
+
+    assert.strictEqual(Buffer.isBuffer(context.localNonce), true);
+    assert.strictEqual(context.localNonce.length, 16);
+    assert.strictEqual(context.localConfirm.length, 16);
+    assert.strictEqual(context.localConfirm.equals(expectedConfirm), true);
+    assert.strictEqual(context.peerNonce, null);
+    assert.strictEqual(
+      context.confirmRandomStage,
+      'localConfirmReady'
+    );
+  });
+
+  it('should use PKbx, PKax, Nb, and zero for responder f4', function() {
+    const connection = newConnection();
+    const callerNonce = Buffer.from(localNonceB);
+    const originalNonce = Buffer.from(callerNonce);
+
+    completeKeyExchange(connection, privateB, publicA);
+    connection.smp.startScConfirmRandom(callerNonce);
+
+    const expectedConfirm = bluetoothCrypto.f4(
+      publicB.slice(0, 32),
+      publicA.slice(0, 32),
+      localNonceB,
+      Buffer.from([0x00])
+    );
+
+    assert.deepStrictEqual(callerNonce, originalNonce);
+    assert.deepStrictEqual(
+      connection.smp._scKeyExchange.localNonce,
+      localNonceB
+    );
+    assert.strictEqual(
+      connection.smp._scKeyExchange.localConfirm.equals(expectedConfirm),
+      true
+    );
+  });
+
+  it('should complete the responder Confirm and Random state order', function() {
+    const connection = newConnection();
+
+    completeKeyExchange(connection, privateB, publicA);
+    assert.strictEqual(
+      connection.smp._scKeyExchange.confirmRandomStage,
+      'keyExchangeComplete'
+    );
+
+    connection.smp.startScConfirmRandom(localNonceB);
+    const confirmPdu = connection.smp.buildScConfirmPdu();
+
+    assert.deepStrictEqual(
+      Smp.parsePairingConfirmPdu(confirmPdu),
+      connection.smp._scKeyExchange.localConfirm
+    );
+    assert.strictEqual(
+      connection.smp._scKeyExchange.confirmRandomStage,
+      'localConfirmBuilt'
+    );
+
+    connection.smp.processScRandomPdu(
+      Smp.buildPairingRandomPdu(peerNonceA)
+    );
+
+    assert.deepStrictEqual(
+      connection.smp._scKeyExchange.peerNonce,
+      peerNonceA
+    );
+    assert.strictEqual(
+      connection.smp._scKeyExchange.confirmRandomStage,
+      'peerRandomReceived'
+    );
+
+    const randomPdu = connection.smp.buildScRandomPdu();
+
+    assert.deepStrictEqual(
+      Smp.parsePairingRandomPdu(randomPdu),
+      localNonceB
+    );
+    assert.strictEqual(
+      connection.smp._scKeyExchange.confirmRandomStage,
+      'confirmRandomComplete'
+    );
+  });
+
+  it('should reject invalid nonce inputs and clear the context', function() {
+    const connection = newConnection();
+
+    completeKeyExchange(connection, privateB, publicA);
+    const firstPrivateKey =
+      connection.smp._scKeyExchange.localPrivateKey;
+    const firstDhKey = connection.smp._scKeyExchange.dhKey;
+
+    assert.throws(function() {
+      connection.smp.startScConfirmRandom('not a Buffer');
+    }, TypeError);
+    assertZeroed(firstPrivateKey);
+    assertZeroed(firstDhKey);
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+
+    completeKeyExchange(connection, privateB, publicA);
+    const secondPrivateKey =
+      connection.smp._scKeyExchange.localPrivateKey;
+    const secondDhKey = connection.smp._scKeyExchange.dhKey;
+
+    assert.throws(function() {
+      connection.smp.startScConfirmRandom(Buffer.alloc(15));
+    }, RangeError);
+    assertZeroed(secondPrivateKey);
+    assertZeroed(secondDhKey);
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+  });
+
+  it('should reject missing context and out-of-order operations', function() {
+    const withoutContext = newConnection();
+
+    assert.throws(function() {
+      withoutContext.smp.startScConfirmRandom(localNonceB);
+    });
+
+    const confirmBeforeStart = newConnection();
+    completeKeyExchange(confirmBeforeStart, privateB, publicA);
+    assert.throws(function() {
+      confirmBeforeStart.smp.buildScConfirmPdu();
+    });
+    assert.strictEqual(confirmBeforeStart.smp._scKeyExchange, null);
+
+    const randomBeforeConfirm = newConnection();
+    completeKeyExchange(randomBeforeConfirm, privateB, publicA);
+    randomBeforeConfirm.smp.startScConfirmRandom(localNonceB);
+    assert.throws(function() {
+      randomBeforeConfirm.smp.processScRandomPdu(
+        Smp.buildPairingRandomPdu(peerNonceA)
+      );
+    });
+    assert.strictEqual(randomBeforeConfirm.smp._scKeyExchange, null);
+
+    const localRandomBeforePeer = newConnection();
+    completeKeyExchange(localRandomBeforePeer, privateB, publicA);
+    localRandomBeforePeer.smp.startScConfirmRandom(localNonceB);
+    localRandomBeforePeer.smp.buildScConfirmPdu();
+    assert.throws(function() {
+      localRandomBeforePeer.smp.buildScRandomPdu();
+    });
+    assert.strictEqual(localRandomBeforePeer.smp._scKeyExchange, null);
+  });
+
+  it('should reject duplicate Confirm and Random operations', function() {
+    const duplicateConfirm = newConnection();
+    completeKeyExchange(duplicateConfirm, privateB, publicA);
+    duplicateConfirm.smp.startScConfirmRandom(localNonceB);
+    duplicateConfirm.smp.buildScConfirmPdu();
+    assert.throws(function() {
+      duplicateConfirm.smp.buildScConfirmPdu();
+    });
+    assert.strictEqual(duplicateConfirm.smp._scKeyExchange, null);
+
+    const duplicatePeerRandom = newConnection();
+    completeKeyExchange(duplicatePeerRandom, privateB, publicA);
+    duplicatePeerRandom.smp.startScConfirmRandom(localNonceB);
+    duplicatePeerRandom.smp.buildScConfirmPdu();
+    const peerRandomPdu = Smp.buildPairingRandomPdu(peerNonceA);
+    duplicatePeerRandom.smp.processScRandomPdu(peerRandomPdu);
+    assert.throws(function() {
+      duplicatePeerRandom.smp.processScRandomPdu(peerRandomPdu);
+    });
+    assert.strictEqual(duplicatePeerRandom.smp._scKeyExchange, null);
+
+    const duplicateLocalRandom = newConnection();
+    completeConfirmRandom(duplicateLocalRandom);
+    assert.throws(function() {
+      duplicateLocalRandom.smp.buildScRandomPdu();
+    });
+    assert.strictEqual(duplicateLocalRandom.smp._scKeyExchange, null);
+  });
+
+  it('should reject invalid Random PDUs and preserve caller buffers', function() {
+    const connection = newConnection();
+    const callerNonce = Buffer.from(localNonceB);
+    const peerRandomPdu = Smp.buildPairingRandomPdu(peerNonceA);
+    const originalPeerRandomPdu = Buffer.from(peerRandomPdu);
+
+    completeKeyExchange(connection, privateB, publicA);
+    connection.smp.startScConfirmRandom(callerNonce);
+    const confirmPdu = connection.smp.buildScConfirmPdu();
+    const originalConfirm = Buffer.from(
+      connection.smp._scKeyExchange.localConfirm
+    );
+
+    connection.smp.processScRandomPdu(peerRandomPdu);
+    const randomPdu = connection.smp.buildScRandomPdu();
+
+    confirmPdu.fill(0);
+    randomPdu.fill(0);
+
+    assert.deepStrictEqual(callerNonce, localNonceB);
+    assert.deepStrictEqual(peerRandomPdu, originalPeerRandomPdu);
+    assert.deepStrictEqual(
+      connection.smp._scKeyExchange.localConfirm,
+      originalConfirm
+    );
+    assert.deepStrictEqual(
+      connection.smp._scKeyExchange.localNonce,
+      localNonceB
+    );
+    assert.deepStrictEqual(
+      connection.smp._scKeyExchange.peerNonce,
+      peerNonceA
+    );
+
+    connection.smp.resetScKeyExchange();
+    completeKeyExchange(connection, privateB, publicA);
+    connection.smp.startScConfirmRandom(localNonceB);
+    connection.smp.buildScConfirmPdu();
+
+    assert.throws(function() {
+      connection.smp.processScRandomPdu(Buffer.alloc(16));
+    }, RangeError);
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+  });
+
   it('should clear the previous context when a new start fails', function() {
     const connection = newConnection();
 
@@ -536,18 +854,28 @@ describe('HCI socket SMP ephemeral key exchange', function() {
     assert.strictEqual(connection.smp._scKeyExchange, null);
   });
 
-  it('should reset and clear secrets after successful key exchange', function() {
+  it('should reset and clear all secrets after Confirm and Random', function() {
     const connection = newConnection();
 
-    completeKeyExchange(connection, privateB, publicA);
+    completeConfirmRandom(connection);
 
     const privateKey = connection.smp._scKeyExchange.localPrivateKey;
     const dhKey = connection.smp._scKeyExchange.dhKey;
+    const localNonce = connection.smp._scKeyExchange.localNonce;
+    const peerNonce = connection.smp._scKeyExchange.peerNonce;
+    const localConfirm = connection.smp._scKeyExchange.localConfirm;
 
     connection.smp.resetScKeyExchange();
 
     assertZeroed(privateKey);
     assertZeroed(dhKey);
+    assertZeroed(localNonce);
+    assertZeroed(peerNonce);
+    assertZeroed(localConfirm);
+    assert.strictEqual(connection.smp._scKeyExchange, null);
+
+    connection.smp.resetScKeyExchange();
+
     assert.strictEqual(connection.smp._scKeyExchange, null);
   });
 
@@ -555,10 +883,13 @@ describe('HCI socket SMP ephemeral key exchange', function() {
     const connection = newConnection();
     let failCount = 0;
 
-    completeKeyExchange(connection, privateB, publicA);
+    completeConfirmRandom(connection);
 
     const privateKey = connection.smp._scKeyExchange.localPrivateKey;
     const dhKey = connection.smp._scKeyExchange.dhKey;
+    const localNonce = connection.smp._scKeyExchange.localNonce;
+    const peerNonce = connection.smp._scKeyExchange.peerNonce;
+    const localConfirm = connection.smp._scKeyExchange.localConfirm;
 
     connection.smp.on('fail', function() {
       failCount++;
@@ -567,6 +898,9 @@ describe('HCI socket SMP ephemeral key exchange', function() {
 
     assertZeroed(privateKey);
     assertZeroed(dhKey);
+    assertZeroed(localNonce);
+    assertZeroed(peerNonce);
+    assertZeroed(localConfirm);
     assert.strictEqual(connection.smp._scKeyExchange, null);
     assert.strictEqual(failCount, 1);
   });
@@ -574,15 +908,21 @@ describe('HCI socket SMP ephemeral key exchange', function() {
   it('should reset and clear secrets when the ACL stream ends', function() {
     const connection = newConnection();
 
-    completeKeyExchange(connection, privateB, publicA);
+    completeConfirmRandom(connection);
 
     const privateKey = connection.smp._scKeyExchange.localPrivateKey;
     const dhKey = connection.smp._scKeyExchange.dhKey;
+    const localNonce = connection.smp._scKeyExchange.localNonce;
+    const peerNonce = connection.smp._scKeyExchange.peerNonce;
+    const localConfirm = connection.smp._scKeyExchange.localConfirm;
 
     connection.aclStream.emit('end');
 
     assertZeroed(privateKey);
     assertZeroed(dhKey);
+    assertZeroed(localNonce);
+    assertZeroed(peerNonce);
+    assertZeroed(localConfirm);
     assert.strictEqual(connection.smp._scKeyExchange, null);
   });
 
@@ -598,6 +938,12 @@ describe('HCI socket SMP ephemeral key exchange', function() {
     connectionB.smp.processScPublicKeyPdu(
       connectionA.smp.buildScPublicKeyPdu()
     );
+    connectionB.smp.startScConfirmRandom(localNonceB);
+    connectionB.smp.buildScConfirmPdu();
+    connectionB.smp.processScRandomPdu(
+      Smp.buildPairingRandomPdu(peerNonceA)
+    );
+    connectionB.smp.buildScRandomPdu();
 
     assert.strictEqual(connectionA.aclStream.writes.length, 0);
     assert.strictEqual(connectionB.aclStream.writes.length, 0);
