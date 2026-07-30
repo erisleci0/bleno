@@ -1673,6 +1673,15 @@ describe('HCI socket SMP ephemeral key exchange', function() {
       0x00,
       0x00
     ]);
+    const iphonePairingRequest = Buffer.from([
+      0x01,
+      0x04, // IO capability: KeyboardDisplay
+      0x00, // OOB data not present
+      0x2d, // Bonding, MITM, SC, and CT2 requested
+      0x10,
+      0x0b,
+      0x0b
+    ]);
     const livePairingResponse = Buffer.from([
       0x02,
       0x03, // IO capability: NoInputNoOutput
@@ -1800,6 +1809,45 @@ describe('HCI socket SMP ephemeral key exchange', function() {
       assert.notStrictEqual(connection.smp._pairingTimer, null);
     });
 
+    it('should accept the real iPhone SC capabilities request', function() {
+      const connection = newConnection(officialAddressOptions);
+      const request = Buffer.from(iphonePairingRequest);
+      const originalRequest = Buffer.from(request);
+
+      startLiveSc(connection, request);
+
+      assert.deepStrictEqual(request, originalRequest);
+      assert.deepStrictEqual(
+        connection.aclStream.writes,
+        [{
+          cid: 0x0006,
+          data: livePairingResponse
+        }]
+      );
+      assert.strictEqual(
+        connection.smp._pairingMode,
+        'secureConnections'
+      );
+      assert.strictEqual(
+        connection.smp._pairingStage,
+        'pairingFeaturesExchanged'
+      );
+      assert.notStrictEqual(connection.smp._scKeyExchange, null);
+
+      completeLivePublicKey(connection);
+
+      assert.deepStrictEqual(
+        connection.aclStream.writes.map(function(write) {
+          return write.data[0];
+        }),
+        [0x02, 0x0c, 0x03]
+      );
+      assert.strictEqual(
+        connection.smp._pairingStage,
+        'localConfirmSent'
+      );
+    });
+
     it('should preserve the Legacy feature response', function() {
       const connection = newConnection();
       const legacyRequest = Buffer.from([
@@ -1859,13 +1907,6 @@ describe('HCI socket SMP ephemeral key exchange', function() {
             return request;
           },
           reason: 0x02
-        },
-        {
-          update: function(request) {
-            request[3] |= 0x04;
-            return request;
-          },
-          reason: 0x03
         }
       ];
 
